@@ -80,6 +80,53 @@
   </style>
 
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+  <script>
+    /*
+     * KUROWATCH AUTOMATIC STREAMING CONFIG
+     *
+     * Metadata/episode discovery uses Jikan (MyAnimeList data).
+     *
+     * VIDEO PROVIDER:
+     * Set VIDEO_PROVIDER.resolveEpisode to your authorized video-provider API.
+     *
+     * It must return one of:
+     *   { type: "hls",   url: "https://.../master.m3u8", subtitles: [...] }
+     *   { type: "video", url: "https://.../episode.mp4", subtitles: [...] }
+     *   { type: "embed", url: "https://.../authorized-player/..." }
+     *
+     * The browser NEVER treats a poster image as a video source.
+     */
+    const VIDEO_PROVIDER = {
+      name: 'Authorized Provider',
+
+      async resolveEpisode({ malId, episode, audio }) {
+        /*
+         * Replace this function with your provider's documented API.
+         *
+         * Example response:
+         *
+         * return {
+         *   type: 'hls',
+         *   url: 'https://cdn.example.com/show/episode-1/master.m3u8',
+         *   subtitles: [
+         *     { label: 'English', language: 'en', url: 'https://cdn.example.com/subs/1.vtt', default: true }
+         *   ]
+         * };
+         */
+        return null;
+      }
+    };
+
+    const APP_CONFIG = {
+      jikanBase: 'https://api.jikan.moe/v4',
+      maxSearchResults: 12,
+      maxEpisodesShown: 200,
+      rememberPlaybackPosition: true,
+      autoplayNextEpisode: true,
+      autoPlay: false
+    };
+  </script>
+
 </head>
 
 <body class="font-sans min-h-screen flex flex-col antialiased selection:bg-pink-500 selection:text-white">
@@ -193,9 +240,12 @@
           </div>
 
           <span class="text-xs font-mono font-bold text-pink-400 flex items-center gap-1.5 ml-1">
-            <i class="ph-bold ph-hard-drives text-base"></i> SERVER:
+            <i class="ph-bold ph-hard-drives text-base"></i> SOURCES:
           </span>
           <div id="server-buttons-list" class="flex items-center gap-2 flex-wrap"></div>
+            <span id="provider-status" class="text-[10px] font-mono text-slate-500">
+              Auto provider: configured
+            </span>
         </div>
 
         <div class="flex items-center gap-2.5 text-xs font-mono text-slate-400 flex-wrap">
@@ -494,35 +544,30 @@
 
     function getEpisodeServers(malId, epNum) {
       const show = catalog.find(s => s.mal_id === malId);
-      const configured = show?.streamUrl;
-
       const servers = [];
 
-      if (configured) {
-        const url = typeof configured === 'function'
-          ? configured(epNum, currentAudioMode)
-          : configured;
+      if (show?.streamUrl) {
+        const url = typeof show.streamUrl === 'function'
+          ? show.streamUrl(epNum, currentAudioMode)
+          : show.streamUrl;
 
         if (url) {
           servers.push({
-            name: 'Official Stream',
+            name: 'Configured Stream',
             url,
-            type: 'video'
+            type: isHlsUrl(url) ? 'video' : 'video'
           });
         }
       }
 
-      // Optional authorized iframe source. This is intentionally empty by
-      // default; add your own authorized embed URL to a catalog item if needed.
-      const embed = show?.embedUrl;
-      if (embed) {
-        const url = typeof embed === 'function'
-          ? embed(epNum, currentAudioMode)
-          : embed;
+      if (show?.embedUrl) {
+        const url = typeof show.embedUrl === 'function'
+          ? show.embedUrl(epNum, currentAudioMode)
+          : show.embedUrl;
 
         if (url) {
           servers.push({
-            name: 'Authorized Embed',
+            name: 'Configured Embed',
             url,
             type: 'embed'
           });
@@ -531,7 +576,7 @@
 
       if (!servers.length) {
         servers.push({
-          name: 'No Source',
+          name: 'Auto Provider',
           url: '',
           type: 'empty'
         });
@@ -594,23 +639,22 @@
       return /\.m3u8(?:$|[?#])/i.test(url);
     }
 
-    async function playDirectVideo(url) {
+    async function playDirectVideo(url, subtitles = []) {
       destroyHls();
       embedIframe.src = '';
       embedIframe.classList.add('hidden');
       player.classList.remove('hidden');
-
       hidePlayerMessage();
 
       player.pause();
       player.removeAttribute('src');
+      removeTextTracks();
       player.load();
 
       if (isHlsUrl(url)) {
-        // Safari/iOS/macOS can play HLS natively.
         if (player.canPlayType('application/vnd.apple.mpegurl')) {
           player.src = url;
-        } else if (window.Hls && window.Hls.isSupported()) {
+        } else if (window.Hls && Hls.isSupported()) {
           hlsInstance = new Hls({
             enableWorker: true,
             lowLatencyMode: false
@@ -620,34 +664,107 @@
           hlsInstance.attachMedia(player);
 
           hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            addTextTracks(subtitles);
             attemptPlayback();
           });
 
           hlsInstance.on(Hls.Events.ERROR, (_, data) => {
+            console.error('HLS error:', data);
             if (data?.fatal) {
-              console.error('HLS fatal error:', data);
-              showPlayerError('HLS playback failed', 'The video server rejected the stream or the stream is unavailable.');
+              showPlayerError(
+                'Stream unavailable',
+                'The configured video provider returned a fatal HLS error.'
+              );
             }
           });
         } else {
-          showPlayerError('HLS is not supported', 'This browser cannot play this HLS stream.');
+          showPlayerError(
+            'HLS is not supported',
+            'This browser cannot play this HLS source.'
+          );
           return;
         }
       } else {
         player.src = url;
+        addTextTracks(subtitles);
         player.load();
       }
 
-      player.addEventListener('loadedmetadata', hidePlayerMessage, { once: true });
+      player.addEventListener('loadedmetadata', () => {
+        hidePlayerMessage();
+        restorePlaybackPosition();
+      }, { once: true });
+
       player.addEventListener('error', () => {
         console.error('Video error:', player.error);
         showPlayerError(
           'Video could not be played',
-          'Check that the source URL is valid, publicly reachable, and allows browser playback (CORS/range requests).'
+          'The provider returned an invalid source or the browser could not access it.'
         );
       }, { once: true });
 
       attemptPlayback();
+    }
+
+    function removeTextTracks() {
+      Array.from(player.querySelectorAll('track')).forEach(track => track.remove());
+    }
+
+    function addTextTracks(subtitles = []) {
+      removeTextTracks();
+
+      subtitles.forEach(sub => {
+        if (!sub?.url) return;
+
+        const track = document.createElement('track');
+        track.kind = 'subtitles';
+        track.label = sub.label || sub.language || 'Subtitles';
+        track.srclang = sub.language || 'en';
+        track.src = sub.url;
+        track.default = !!sub.default;
+        player.appendChild(track);
+      });
+    }
+
+    function restorePlaybackPosition() {
+      if (!APP_CONFIG.rememberPlaybackPosition) return;
+
+      const key = getPlaybackKey();
+      const saved = Number(localStorage.getItem(key) || 0);
+
+      if (saved > 5 && Number.isFinite(saved) && saved < player.duration - 5) {
+        player.currentTime = saved;
+      }
+    }
+
+    function getPlaybackKey() {
+      return `kurowatch_position_${currentSeriesId}_${currentEpisodeNum}_${currentAudioMode}`;
+    }
+
+    function savePlaybackPosition() {
+      if (!APP_CONFIG.rememberPlaybackPosition || !Number.isFinite(player.currentTime)) return;
+      if (player.currentTime < 5) return;
+
+      localStorage.setItem(getPlaybackKey(), String(Math.floor(player.currentTime)));
+    }
+
+    function wirePlayerEvents() {
+      player.addEventListener('timeupdate', () => {
+        if (Math.floor(player.currentTime) % 5 === 0) {
+          savePlaybackPosition();
+        }
+      });
+
+      player.addEventListener('ended', () => {
+        savePlaybackPosition();
+
+        const show = catalog.find(s => s.id === currentSeriesId);
+        if (!show || !APP_CONFIG.autoplayNextEpisode) return;
+
+        if (currentEpisodeNum < Number(show.totalEps || 0)) {
+          setTimeout(() => playEpisode(currentEpisodeNum + 1), 250);
+        }
+      });
     }
 
     function attemptPlayback() {
@@ -683,14 +800,79 @@
       );
     }
 
-    function switchStream(malId, epNum, serverIdx) {
+    async function discoverEpisodesForShow(show) {
+      if (!show?.mal_id) return [];
+
+      if (show.episodesCache?.length) {
+        return show.episodesCache;
+      }
+
+      try {
+        const data = await fetchJikan(`/anime/${show.mal_id}/episodes?page=1`);
+        const episodes = (data?.data || []).map(ep => ({
+          number: ep.mal_id,
+          title: ep.title || `Episode ${ep.mal_id}`,
+          aired: ep.aired || null
+        }));
+
+        show.episodesCache = episodes;
+        if (episodes.length) show.totalEps = Math.max(show.totalEps || 0, ...episodes.map(e => e.number));
+        return episodes;
+      } catch (error) {
+        console.warn('Episode discovery failed:', error);
+        return [];
+      }
+    }
+
+    async function switchStream(malId, epNum, serverIdx) {
       currentServerIndex = serverIdx;
       const show = catalog.find(s => s.mal_id === malId);
       const servers = getEpisodeServers(malId, epNum);
       const target = servers[serverIdx] || servers[0];
 
       if (!target || target.type === 'empty') {
-        showNoSourceMessage(show, epNum);
+        setPlayerMessage(
+          'Finding episode source…',
+          `Requesting Episode ${epNum} from ${VIDEO_PROVIDER.name}.`,
+          'ph-spinner'
+        );
+
+        try {
+          const result = await VIDEO_PROVIDER.resolveEpisode({
+            malId,
+            episode: epNum,
+            audio: currentAudioMode,
+            title: show?.title || ''
+          });
+
+          if (!result?.url) {
+            showNoSourceMessage(show, epNum);
+            return;
+          }
+
+          if (result.type === 'embed') {
+            destroyHls();
+            player.pause();
+            player.removeAttribute('src');
+            player.load();
+            player.classList.add('hidden');
+
+            embedIframe.classList.remove('hidden');
+            embedIframe.src = result.url;
+            hidePlayerMessage();
+            return;
+          }
+
+          await playDirectVideo(result.url, result.subtitles || []);
+          return;
+        } catch (error) {
+          console.error('Provider error:', error);
+          showPlayerError(
+            'Could not load episode',
+            `The ${VIDEO_PROVIDER.name} request failed. Check the provider API configuration.`
+          );
+        }
+
         return;
       }
 
@@ -703,14 +885,11 @@
 
         embedIframe.classList.remove('hidden');
         embedIframe.src = target.url;
-
-        // An iframe cannot be inspected for cross-origin playback errors.
-        // Show a useful fallback if the provider refuses to load.
-        embedIframe.onload = () => hidePlayerMessage();
+        hidePlayerMessage();
         return;
       }
 
-      playDirectVideo(target.url);
+      await playDirectVideo(target.url, target.subtitles || []);
     }
 
     function toggleSubDub(mode) {
@@ -734,6 +913,26 @@
     let searchTimer = null;
     const searchCache = {};
 
+    async function fetchJikan(path, options = {}) {
+      const response = await fetch(`${APP_CONFIG.jikanBase}${path}`, {
+        headers: { 'Accept': 'application/json' },
+        ...options
+      });
+
+      if (response.status === 429) {
+        await new Promise(resolve => setTimeout(resolve, 1200));
+        const retry = await fetch(`${APP_CONFIG.jikanBase}${path}`, {
+          headers: { 'Accept': 'application/json' },
+          ...options
+        });
+        if (!retry.ok) throw new Error(`Jikan HTTP ${retry.status}`);
+        return retry.json();
+      }
+
+      if (!response.ok) throw new Error(`Jikan HTTP ${response.status}`);
+      return response.json();
+    }
+
     function handleSearchDebounced(query) {
       clearTimeout(searchTimer);
       const spinner = document.getElementById('search-spinner');
@@ -753,13 +952,7 @@
 
       searchTimer = setTimeout(async () => {
         try {
-          const res = await fetch(`https://api.jikan.moe/v4/anime?q=${encodeURIComponent(query)}&limit=12`);
-          if (res.status === 429) {
-            filterLocal(query);
-            return;
-          }
-
-          const data = await res.json();
+          const data = await fetchJikan(`/anime?q=${encodeURIComponent(query)}&limit=${APP_CONFIG.maxSearchResults}`);
           if (data && data.data && data.data.length > 0) {
             const results = data.data.map(item => ({
               id: 'mal-' + item.mal_id,
@@ -1033,9 +1226,12 @@
       saveHistory();
     };
 
+    window.addEventListener('beforeunload', savePlaybackPosition);
+
     // Initial UI.
     document.addEventListener('DOMContentLoaded', () => {
       initUserSession();
+      wirePlayerEvents();
       renderCatalog();
       initFromUrl();
     });

@@ -76,7 +76,10 @@
       width: 100%;
       height: 100%;
     }
+  .player-status-overlay-hidden { display: none; }
   </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 </head>
 
 <body class="font-sans min-h-screen flex flex-col antialiased selection:bg-pink-500 selection:text-white">
@@ -212,6 +215,8 @@
         <div class="relative bg-black aspect-video max-h-[620px] w-full flex items-center justify-center overflow-hidden">
           
           <!-- Native HTML5 Direct Player -->
+          <div id="player-status-overlay" class="absolute inset-0 z-20 hidden flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm"></div>
+
           <video 
             id="main-video-player" 
             class="w-full h-full object-contain hidden" 
@@ -392,7 +397,9 @@
         author: 'A-1 Pictures',
         coverPhoto: 'https://cdn.myanimelist.net/images/anime/1188/136926l.jpg',
         desc: 'In a world where hunters battle monsters, Sung Jinwoo awakens a quest line that lets him level up alone.',
-        totalEps: 12
+        totalEps: 12,
+        streamUrl: '',
+        embedUrl: ''
       },
       {
         id: 'mal-52034',
@@ -401,7 +408,9 @@
         author: 'Madhouse',
         coverPhoto: 'https://cdn.myanimelist.net/images/anime/1015/138075l.jpg',
         desc: 'Elf mage Frieren begins a journey to understand mortals after the passing of her former party leader.',
-        totalEps: 28
+        totalEps: 28,
+        streamUrl: '',
+        embedUrl: ''
       },
       {
         id: 'mal-51009',
@@ -410,7 +419,9 @@
         author: 'MAPPA',
         coverPhoto: 'https://cdn.myanimelist.net/images/anime/1792/138022l.jpg',
         desc: 'The Shibuya Incident unfolds as curse users seek to permanently seal Gojo Satoru.',
-        totalEps: 23
+        totalEps: 23,
+        streamUrl: '',
+        embedUrl: ''
       },
       {
         id: 'mal-47778',
@@ -419,7 +430,9 @@
         author: 'ufotable',
         coverPhoto: 'https://cdn.myanimelist.net/images/anime/1286/99889l.jpg',
         desc: 'Tanjiro Kamado trains to become a Demon Slayer to cure his demonized sister Nezuko.',
-        totalEps: 26
+        totalEps: 26,
+        streamUrl: '',
+        embedUrl: ''
       },
       {
         id: 'mal-21',
@@ -428,7 +441,9 @@
         author: 'Toei Animation',
         coverPhoto: 'https://cdn.myanimelist.net/images/anime/6/73245l.jpg',
         desc: 'Monkey D. Luffy sets sail with his crew across the Grand Line in search of the One Piece.',
-        totalEps: 1100
+        totalEps: 1100,
+        streamUrl: '',
+        embedUrl: ''
       },
       {
         id: 'mal-41467',
@@ -437,7 +452,9 @@
         author: 'Pierrot',
         coverPhoto: 'https://cdn.myanimelist.net/images/anime/1764/126627l.jpg',
         desc: 'Soul Society is suddenly invaded by the Quincy empire led by Yhwach.',
-        totalEps: 13
+        totalEps: 13,
+        streamUrl: '',
+        embedUrl: ''
       }
     ];
 
@@ -451,145 +468,262 @@
     const embedIframe = document.getElementById('embed-video-player');
 
     // ==========================================================
-    // 2. WORKING STREAM GATEWAYS
+    // 2. PLAYER / STREAM SOURCES
     // ==========================================================
+    // IMPORTANT:
+    // The catalog originally contained anime metadata and thumbnails, but
+    // it did NOT contain actual playable anime video files. A thumbnail
+    // cannot be converted into a video source.
+    //
+    // Put ONLY video sources you are authorized to serve here:
+    //   - MP4 / WebM: https://your-domain.example/video.mp4
+    //   - HLS:        https://your-domain.example/video/master.m3u8
+    //   - Embed:      https://your-authorized-player.example/embed/...
+    //
+    // Leave streamUrl empty when no authorized source exists.
+    //
+    // Example:
+    // streamUrl: "https://media.example.com/episodes/1/master.m3u8"
+
+    const PLAYER_CONFIG = {
+      autoplay: false,
+      mutedAutoplayFallback: true
+    };
+
+    let hlsInstance = null;
+
     function getEpisodeServers(malId, epNum) {
-      const isDub = (currentAudioMode === 'DUB');
-      return [
-        { 
-          name: 'AutoEmbed (Server 1)', 
-          url: `https://player.autoembed.cc/embed/anime/${malId}/${epNum}?dub=${isDub ? 1 : 0}`, 
-          type: 'embed' 
-        },
-        { 
-          name: 'VidSrc (Server 2)', 
-          url: `https://vidsrc.cc/v2/embed/anime/${malId}/${epNum}/${currentAudioMode.toLowerCase()}`, 
-          type: 'embed' 
-        },
-        { 
-          name: 'Direct Stream (Backup)', 
-          url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4', 
-          type: 'video' 
+      const show = catalog.find(s => s.mal_id === malId);
+      const configured = show?.streamUrl;
+
+      const servers = [];
+
+      if (configured) {
+        const url = typeof configured === 'function'
+          ? configured(epNum, currentAudioMode)
+          : configured;
+
+        if (url) {
+          servers.push({
+            name: 'Official Stream',
+            url,
+            type: 'video'
+          });
         }
-      ];
+      }
+
+      // Optional authorized iframe source. This is intentionally empty by
+      // default; add your own authorized embed URL to a catalog item if needed.
+      const embed = show?.embedUrl;
+      if (embed) {
+        const url = typeof embed === 'function'
+          ? embed(epNum, currentAudioMode)
+          : embed;
+
+        if (url) {
+          servers.push({
+            name: 'Authorized Embed',
+            url,
+            type: 'embed'
+          });
+        }
+      }
+
+      if (!servers.length) {
+        servers.push({
+          name: 'No Source',
+          url: '',
+          type: 'empty'
+        });
+      }
+
+      return servers;
     }
 
-    function loadSeries(seriesId, epNum = 1) {
-      const show = catalog.find(s => s.id === seriesId);
-      if (!show) return;
-
-      currentSeriesId = seriesId;
-      currentEpisodeNum = epNum;
-
-      document.getElementById('player-title').textContent = show.title;
-      document.getElementById('player-series-cover').src = show.coverPhoto;
-      document.getElementById('player-creator').textContent = show.author || 'Studio';
-      document.getElementById('player-description').textContent = show.desc;
-      document.getElementById('episode-total-count').textContent = `${show.totalEps} Episodes Available`;
-
-      renderEpisodes(show.totalEps);
-      playEpisode(epNum);
-      renderCatalog();
-    }
-
-    function renderEpisodes(totalEps) {
-      const container = document.getElementById('episodes-list-container');
-      container.innerHTML = '';
-      const displayCount = Math.min(totalEps || 12, 100);
-
-      for (let i = 1; i <= displayCount; i++) {
-        const isCurrent = (i === currentEpisodeNum);
-        const card = document.createElement('button');
-        card.className = `ep-btn p-2 rounded-xl border text-left transition flex flex-col justify-between ${
-          isCurrent 
-            ? 'bg-pink-500/20 border-pink-400 shadow-md shadow-pink-500/20' 
-            : 'bg-slate-950 border-white/10 hover:border-pink-500/50'
-        }`;
-        card.onclick = () => playEpisode(i);
-
-        card.innerHTML = `
-          <div class="flex items-center justify-between w-full">
-            <span class="text-[10px] font-mono font-bold text-pink-300">EP ${i}</span>
-            <i class="ph-fill ${isCurrent ? 'ph-waveform text-pink-400' : 'ph-play text-slate-500'} text-xs"></i>
-          </div>
-          <span class="text-xs font-semibold text-white truncate mt-1">Episode ${i}</span>
-        `;
-        container.appendChild(card);
+    function destroyHls() {
+      if (hlsInstance) {
+        try { hlsInstance.destroy(); } catch (_) {}
+        hlsInstance = null;
       }
     }
 
-    function playEpisode(epNum) {
-      currentEpisodeNum = epNum;
-      const show = catalog.find(s => s.id === currentSeriesId);
-      if (!show) return;
+    function setPlayerMessage(title, message, icon = 'ph-play-circle') {
+      let overlay = document.getElementById('player-status-overlay');
 
-      document.getElementById('player-active-episode-title').textContent = `Now Playing: Episode ${epNum}`;
-      document.getElementById('player-badge-type').textContent = `${currentAudioMode}: EP ${epNum}`;
+      if (!overlay) {
+        const wrapper = document.querySelector('#main-video-player')?.parentElement;
+        if (!wrapper) return;
 
-      document.querySelectorAll('#episodes-list-container .ep-btn').forEach((btn, idx) => {
-        if (idx + 1 === epNum) {
-          btn.className = 'ep-btn p-2 rounded-xl border text-left transition flex flex-col justify-between bg-pink-500/20 border-pink-400 shadow-md shadow-pink-500/20';
-        } else {
-          btn.className = 'ep-btn p-2 rounded-xl border text-left transition flex flex-col justify-between bg-slate-950 border-white/10 hover:border-pink-500/50';
-        }
-      });
+        overlay = document.createElement('div');
+        overlay.id = 'player-status-overlay';
+        overlay.className =
+          'absolute inset-0 z-20 flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm';
 
-      renderServerButtons(show.mal_id, epNum);
-      switchStream(show.mal_id, epNum, currentServerIndex);
+        wrapper.appendChild(overlay);
+      }
+
+      overlay.innerHTML = `
+        <div class="max-w-lg text-center space-y-3">
+          <div class="mx-auto w-14 h-14 rounded-2xl bg-pink-500/15 border border-pink-400/30
+                      flex items-center justify-center text-pink-300">
+            <i class="ph-bold ${icon} text-2xl"></i>
+          </div>
+          <h3 class="text-white font-sakura font-bold text-lg">${escapeHtml(title)}</h3>
+          <p class="text-slate-400 text-xs leading-relaxed">${escapeHtml(message)}</p>
+        </div>
+      `;
+      overlay.classList.remove('hidden');
     }
 
-    function renderServerButtons(malId, epNum) {
-      const container = document.getElementById('server-buttons-list');
-      container.innerHTML = '';
-      const servers = getEpisodeServers(malId, epNum);
+    function hidePlayerMessage() {
+      const overlay = document.getElementById('player-status-overlay');
+      if (overlay) overlay.classList.add('hidden');
+    }
 
-      servers.forEach((srv, idx) => {
-        const btn = document.createElement('button');
-        btn.className = `srv-btn px-3 py-1 rounded-xl text-xs font-mono font-bold transition flex items-center gap-1.5 ${
-          idx === currentServerIndex ? 'bg-pink-500 text-white shadow-md' : 'bg-slate-900 text-slate-300 hover:text-white border border-white/10'
-        }`;
-        btn.textContent = srv.name;
-        btn.onclick = () => {
-          currentServerIndex = idx;
-          container.querySelectorAll('.srv-btn').forEach((b, bIdx) => {
-            b.className = (bIdx === idx) 
-              ? 'srv-btn px-3 py-1 rounded-xl text-xs font-mono font-bold bg-pink-500 text-white shadow-md' 
-              : 'srv-btn px-3 py-1 rounded-xl text-xs font-mono font-bold bg-slate-900 text-slate-300 hover:text-white border border-white/10';
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+      }[ch]));
+    }
+
+    function isHlsUrl(url) {
+      return /\.m3u8(?:$|[?#])/i.test(url);
+    }
+
+    async function playDirectVideo(url) {
+      destroyHls();
+      embedIframe.src = '';
+      embedIframe.classList.add('hidden');
+      player.classList.remove('hidden');
+
+      hidePlayerMessage();
+
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+
+      if (isHlsUrl(url)) {
+        // Safari/iOS/macOS can play HLS natively.
+        if (player.canPlayType('application/vnd.apple.mpegurl')) {
+          player.src = url;
+        } else if (window.Hls && window.Hls.isSupported()) {
+          hlsInstance = new Hls({
+            enableWorker: true,
+            lowLatencyMode: false
           });
-          switchStream(malId, epNum, idx);
-        };
-        container.appendChild(btn);
+
+          hlsInstance.loadSource(url);
+          hlsInstance.attachMedia(player);
+
+          hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            attemptPlayback();
+          });
+
+          hlsInstance.on(Hls.Events.ERROR, (_, data) => {
+            if (data?.fatal) {
+              console.error('HLS fatal error:', data);
+              showPlayerError('HLS playback failed', 'The video server rejected the stream or the stream is unavailable.');
+            }
+          });
+        } else {
+          showPlayerError('HLS is not supported', 'This browser cannot play this HLS stream.');
+          return;
+        }
+      } else {
+        player.src = url;
+        player.load();
+      }
+
+      player.addEventListener('loadedmetadata', hidePlayerMessage, { once: true });
+      player.addEventListener('error', () => {
+        console.error('Video error:', player.error);
+        showPlayerError(
+          'Video could not be played',
+          'Check that the source URL is valid, publicly reachable, and allows browser playback (CORS/range requests).'
+        );
+      }, { once: true });
+
+      attemptPlayback();
+    }
+
+    function attemptPlayback() {
+      if (!PLAYER_CONFIG.autoplay) return;
+
+      player.play().catch(() => {
+        if (PLAYER_CONFIG.mutedAutoplayFallback) {
+          player.muted = true;
+          player.play().catch(() => {});
+        }
       });
+    }
+
+    function showPlayerError(title, message) {
+      player.pause();
+      player.classList.remove('hidden');
+      embedIframe.classList.add('hidden');
+      setPlayerMessage(title, message, 'ph-warning-circle');
+    }
+
+    function showNoSourceMessage(show, epNum) {
+      destroyHls();
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+      player.classList.remove('hidden');
+      embedIframe.classList.add('hidden');
+
+      setPlayerMessage(
+        'Episode source not configured',
+        `${show.title} — Episode ${epNum} has artwork and metadata, but this site has no authorized video URL configured for it. Add a streamUrl or embedUrl to the catalog entry.`,
+        'ph-video-camera-slash'
+      );
     }
 
     function switchStream(malId, epNum, serverIdx) {
       currentServerIndex = serverIdx;
+      const show = catalog.find(s => s.mal_id === malId);
       const servers = getEpisodeServers(malId, epNum);
       const target = servers[serverIdx] || servers[0];
 
+      if (!target || target.type === 'empty') {
+        showNoSourceMessage(show, epNum);
+        return;
+      }
+
       if (target.type === 'embed') {
+        destroyHls();
         player.pause();
+        player.removeAttribute('src');
+        player.load();
         player.classList.add('hidden');
+
         embedIframe.classList.remove('hidden');
         embedIframe.src = target.url;
-      } else {
-        embedIframe.src = '';
-        embedIframe.classList.add('hidden');
-        player.classList.remove('hidden');
-        player.src = target.url;
-        player.load();
-        player.play().catch(() => {});
+
+        // An iframe cannot be inspected for cross-origin playback errors.
+        // Show a useful fallback if the provider refuses to load.
+        embedIframe.onload = () => hidePlayerMessage();
+        return;
       }
+
+      playDirectVideo(target.url);
     }
 
     function toggleSubDub(mode) {
       currentAudioMode = mode;
-      document.getElementById('sub-mode-btn').className = (mode === 'SUB') 
-        ? 'px-3 py-1 rounded-lg text-xs font-mono font-bold bg-pink-500 text-white' 
+
+      document.getElementById('sub-mode-btn').className = (mode === 'SUB')
+        ? 'px-3 py-1 rounded-lg text-xs font-mono font-bold bg-pink-500 text-white'
         : 'px-3 py-1 rounded-lg text-xs font-mono font-bold text-slate-400 hover:text-white';
-      document.getElementById('dub-mode-btn').className = (mode === 'DUB') 
-        ? 'px-3 py-1 rounded-lg text-xs font-mono font-bold bg-pink-500 text-white' 
+
+      document.getElementById('dub-mode-btn').className = (mode === 'DUB')
+        ? 'px-3 py-1 rounded-lg text-xs font-mono font-bold bg-pink-500 text-white'
         : 'px-3 py-1 rounded-lg text-xs font-mono font-bold text-slate-400 hover:text-white';
+
       playEpisode(currentEpisodeNum);
       showToast(`Switched audio to ${mode}`);
     }
@@ -634,7 +768,9 @@
               author: (item.studios && item.studios[0]) ? item.studios[0].name : 'Studio',
               coverPhoto: item.images.jpg.large_image_url || item.images.jpg.image_url,
               desc: item.synopsis || 'Anime series synopsis.',
-              totalEps: item.episodes || 12
+              totalEps: item.episodes || 12,
+              streamUrl: '',
+              embedUrl: ''
             }));
 
             searchCache[query] = results;
@@ -784,51 +920,125 @@
       document.getElementById('schedule-modal').classList.add('flex');
     }
 
+
     function closeScheduleModal() {
-      document.getElementByIdTwo distinct mechanics explain why your website did not appear in Google search results and why an existing platform showed up instead.
+      document.getElementById('schedule-modal').classList.add('hidden');
+      document.getElementById('schedule-modal').classList.remove('flex');
+    }
 
----
+    function openHistoryModal() {
+      renderHistory();
+      document.getElementById('history-modal').classList.remove('hidden');
+      document.getElementById('history-modal').classList.add('flex');
+    }
 
-### Why Your Site Did Not Show Up in Search Engines
+    function closeHistoryModal() {
+      document.getElementById('history-modal').classList.add('hidden');
+      document.getElementById('history-modal').classList.remove('flex');
+    }
 
-1. **Typing into the Search Bar vs. the Address Bar:**
-   * Entering words like "AniSakura" into a search bar queries Google’s index, not direct website addresses.
-   * Google takes days or weeks to crawl and index brand-new GitHub Pages sites. Because a pre-existing platform already holds the "AniSakura" name with established web traffic and backlinks, search engines rank that existing domain first.
-   * To view your site directly on any mobile device or external computer right now, enter the full URL directly into the browser's top **address bar** (where `https://` resides):
-     ```text
-     [https://kuro2607.github.io/aniflix1/](https://kuro2607.github.io/aniflix1/)
-     ```
+    function saveHistory() {
+      const show = catalog.find(s => s.id === currentSeriesId);
+      if (!show) return;
 
-2. **GitHub Repository Name vs. Display Title:**
-   * Your GitHub repository itself is named `aniflix1`. GitHub Pages derives its link structure directly from your username and repository name (`kuro2607.github.io/aniflix1/`).
-   * Renaming the visual text inside your HTML header updates the page header, but the web address remains tied to the repository slug unless you rename the repository in your GitHub settings.
+      const history = JSON.parse(localStorage.getItem('kurowatch_history') || '[]');
+      const item = {
+        seriesId: show.id,
+        title: show.title,
+        episode: currentEpisodeNum,
+        coverPhoto: show.coverPhoto,
+        timestamp: Date.now()
+      };
 
----
+      const filtered = history.filter(x =>
+        !(x.seriesId === item.seriesId && x.episode === item.episode)
+      );
 
-### Distinctive Brand Names for Better Search Visibility
+      localStorage.setItem(
+        'kurowatch_history',
+        JSON.stringify([item, ...filtered].slice(0, 30))
+      );
+    }
 
-To avoid competing against mature streaming domains, choose a clean, distinctive name that combines your handle (`kuro`) with an anime-themed term.
+    function renderHistory() {
+      const container = document.getElementById('history-list-container');
+      const history = JSON.parse(localStorage.getItem('kurowatch_history') || '[]');
 
-| Brand Option | Suggested Repo Slug | Target URL on GitHub Pages |
-| :--- | :--- | :--- |
-| **KuroWatch** | `kurowatch` | `kuro2607.github.io/kurowatch/` |
-| **KuroStream** | `kurostream` | `kuro2607.github.io/kurostream/` |
-| **KuroFlix** | `kuroflix` | `kuro2607.github.io/kuroflix/` |
-| **KuroNeko Stream** | `kuroneko-stream` | `kuro2607.github.io/kuroneko-stream/` |
+      if (!history.length) {
+        container.innerHTML = `
+          <div class="text-center text-slate-500 py-10">
+            <i class="ph-bold ph-clock-counter-clockwise text-3xl mb-2"></i>
+            <p>No watch history yet.</p>
+          </div>
+        `;
+        return;
+      }
 
-**KuroWatch** provides a concise, distinct profile with minimal competition from existing domains.
+      container.innerHTML = history.map(item => `
+        <button
+          class="w-full flex items-center gap-3 p-3 rounded-2xl bg-slate-950 border border-white/5 hover:border-pink-400/40 text-left transition"
+          onclick="loadSeries('${escapeHtml(item.seriesId)}', ${Number(item.episode) || 1}); closeHistoryModal();"
+        >
+          <img src="${escapeHtml(item.coverPhoto)}" class="w-10 h-14 rounded-lg object-cover" alt="">
+          <span class="min-w-0">
+            <span class="block text-white font-semibold truncate">${escapeHtml(item.title)}</span>
+            <span class="block text-pink-300 font-mono text-[10px] mt-1">Episode ${Number(item.episode) || 1}</span>
+          </span>
+        </button>
+      `).join('');
+    }
 
----
+    async function copyShareUrl() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('anime', currentSeriesId);
+      url.searchParams.set('episode', currentEpisodeNum);
 
-### Step 1: Update Your Repository Name on GitHub
+      try {
+        await navigator.clipboard.writeText(url.toString());
+        showToast('Share link copied.');
+      } catch (_) {
+        showToast('Copy failed. Please copy the page URL manually.');
+      }
+    }
 
-To align your URL with your new brand:
+    function showToast(message) {
+      const toast = document.getElementById('toast-msg');
+      const text = document.getElementById('toast-text');
+      if (!toast || !text) return;
 
-1. Open your repository on GitHub (`https://github.com/kuro2607/aniflix1`).
-2. Click the **Settings** tab (the gear icon on the top horizontal bar).
-3. Under the **General** section, locate the **Repository name** field.
-4. Replace `aniflix1` with `kurowatch`.
-5. Click **Rename**.
-6. Check **Settings** $\rightarrow$ **Pages** to verify your updated live link:
-   ```text
-   [https://kuro2607.github.io/kurowatch/](https://kuro2607.github.io/kurowatch/)
+      text.textContent = message;
+      toast.classList.remove('translate-y-24', 'opacity-0');
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(() => {
+        toast.classList.add('translate-y-24', 'opacity-0');
+      }, 2800);
+    }
+
+    function initFromUrl() {
+      const params = new URLSearchParams(window.location.search);
+      const animeId = params.get('anime');
+      const episode = Math.max(1, Number(params.get('episode')) || 1);
+
+      if (animeId && catalog.some(s => s.id === animeId)) {
+        loadSeries(animeId, episode);
+      } else {
+        loadSeries(currentSeriesId, 1);
+      }
+    }
+
+    // Keep history in sync whenever an episode is selected.
+    const originalPlayEpisode = playEpisode;
+    playEpisode = function(epNum) {
+      originalPlayEpisode(epNum);
+      saveHistory();
+    };
+
+    // Initial UI.
+    document.addEventListener('DOMContentLoaded', () => {
+      initUserSession();
+      renderCatalog();
+      initFromUrl();
+    });
+  </script>
+</body>
+</html>
